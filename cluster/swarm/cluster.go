@@ -65,6 +65,7 @@ type Cluster struct {
 	scheduler         *scheduler.Scheduler
 	discovery         discovery.Backend
 	pendingContainers map[string]*pendingContainer
+	builds            *buildSyncer
 
 	overcommitRatio float64
 	engineOpts      *cluster.EngineOpts
@@ -87,6 +88,7 @@ func NewCluster(scheduler *scheduler.Scheduler, TLSConfig *tls.Config, discovery
 		overcommitRatio:      0.05,
 		engineOpts:           engineOptions,
 		createRetry:          0,
+		builds:               newBuildSyncer(),
 	}
 
 	if val, ok := options.Float("swarm.overcommit", ""); ok {
@@ -1042,19 +1044,48 @@ func (c *Cluster) RenameContainer(container *cluster.Container, newName string) 
 
 // BuildImage builds an image
 func (c *Cluster) BuildImage(buildContext io.Reader, buildImage *types.ImageBuildOptions, callback func(msg cluster.JSONMessageWrapper)) error {
-	c.scheduler.Lock()
+	// Extra build endpoints handling:
+	// ImageBuildOptions contains SessionID, BuildID
+	// POST /session should block until /build with SessionID picks a node and then forward to same node.
+	// - /session has ID in "X-Docker-Expose-Session-Uuid" header
+	// - https://github.com/moby/moby/blob/master/vendor/github.com/moby/buildkit/session/manager.go#L52
+	// /build/cancel with the same BuildID should go to same node
+	// - https://github.com/moby/moby/blob/master/api/server/router/build/build_routes.go#L197
+	// /build with ID "upload-request:BuildID" should go to same node
 
-	// get an engine
-	config := cluster.BuildContainerConfig(containertypes.Config{Env: convertMapToKVStrings(buildImage.BuildArgs)},
-		containertypes.HostConfig{Resources: containertypes.Resources{CPUShares: buildImage.CPUShares, Memory: buildImage.Memory}},
-		networktypes.NetworkingConfig{})
-	buildImage.BuildArgs = convertKVStringsToMap(config.Env)
-	nodes, err := c.scheduler.SelectNodesForContainer(c.listNodes(), config)
-	c.scheduler.Unlock()
-	if err != nil {
-		return err
+	var n *node.Node
+
+	buildID := buildImage.BuildID
+	sessionID := buildImage.SessionID
+
+	if strings.HasPrefix(buildID, "upload-request:") {
+		buildID = strings.TrimPrefix(buildID, "upload-request:")
+		var err error
+		n, err = c.builds.waitBuildNode(buildID, 5*time.Second)
+		if err != nil {
+			return err
+		}
+	} else {
+		c.scheduler.Lock()
+		// get an engine
+		config := cluster.BuildContainerConfig(containertypes.Config{Env: convertMapToKVStrings(buildImage.BuildArgs)},
+			containertypes.HostConfig{Resources: containertypes.Resources{CPUShares: buildImage.CPUShares, Memory: buildImage.Memory}},
+			networktypes.NetworkingConfig{})
+		buildImage.BuildArgs = convertKVStringsToMap(config.Env)
+		nodes, err := c.scheduler.SelectNodesForContainer(c.listNodes(), config)
+		c.scheduler.Unlock()
+		if err != nil {
+			return err
+		}
+
+		clean, err := c.builds.startBuild(sessionID, buildId, n)
+		if err != nil {
+			return err
+		}
+		defer clean()
+
+		n := nodes[0]
 	}
-	n := nodes[0]
 	engine := c.engines[n.ID]
 
 	var engineCallback func(msg cluster.JSONMessage)
