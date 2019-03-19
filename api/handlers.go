@@ -1424,6 +1424,10 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 		CgroupParent:   r.Form.Get("cgroupparent"),
 		ShmSize:        int64ValueOrZero(r, "shmsize"),
 		Squash:         boolValue(r, "squash"),
+		SessionID:      r.Form.Get("session"),
+		BuildID:        r.Form.Get("buildid"),
+		Target:         r.Form.Get("target"),
+		Platform:       r.Form.Get("platform"),
 	}
 
 	buildArgsJSON := r.Form.Get("buildargs")
@@ -1454,13 +1458,22 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	builderVersion, err := parseVersion(r.Form.Get("version"))
+	if err != nil {
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	buildImage.Version = builderVersion
+
 	w.Header().Set("Content-Type", "application/json")
 	wf := NewWriteFlusher(w)
 
 	var errorMessage string
 	errorFound := false
 	callback := func(msg cluster.JSONMessageWrapper) {
-		msg.Msg.ID = msg.EngineName
+		if builderVersion != apitypes.BuilderBuildKit {
+			msg.Msg.ID = msg.EngineName
+		}
 		if msg.Err != nil {
 			errorFound = true
 			errorMessage = msg.Err.Error()
@@ -1471,7 +1484,7 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(wf).Encode(msg.Msg)
 	}
-	err := c.cluster.BuildImage(r.Body, buildImage, callback)
+	err = c.cluster.BuildImage(r.Body, buildImage, callback)
 	if err != nil {
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1479,6 +1492,16 @@ func postBuild(c *context, w http.ResponseWriter, r *http.Request) {
 	if errorFound {
 		sendErrorJSONMessage(wf, 1, errorMessage)
 	}
+}
+
+func parseVersion(s string) (apitypes.BuilderVersion, error) {
+	if s == "" || s == string(apitypes.BuilderV1) {
+		return apitypes.BuilderV1, nil
+	}
+	if s == string(apitypes.BuilderBuildKit) {
+		return apitypes.BuilderBuildKit, nil
+	}
+	return "", fmt.Errorf("invalid version %s", s)
 }
 
 // POST /build/cancel
